@@ -19,7 +19,6 @@
 #include "em_usart.h"
 #include "em_cmu.h"
 #include "em_i2c.h"
-#include "em_int.h"
 
 #include "ili9341.h"
 #include "utilities.h"
@@ -28,31 +27,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 
-#define FT6206_ADDR           	0x38 << 1
-#define FT6206_FIRMID_OFFSET	0xA6
-#define FT6206_G_MODE_OFFSET	0xA4
-
 // Used for our timer
-extern uint32_t msTicks;
-
-uint8_t data_array[16];
-
-// Data structures to hole current capacitance sensor data
-typedef struct cap_data_type
-{
-	bool touched;
-	uint8_t touch_id;
-	uint16_t x_position;
-	uint16_t y_position;
-} cap_data_struct;
-
-cap_data_struct touch_data[2];
-uint8_t num_touch_points = 0;
-bool interrupt_triggered = false;
-uint16_t pen_color;
-
-// Need to declare the function prototype to call it before we implement it
-int gpio_int_handler_process_touch(uint8_t pin);
+//extern uint32_t msTicks;
 
 void peripheral_setup()
 {
@@ -74,7 +50,7 @@ void peripheral_setup()
 
 	USART_InitSync(USART1, &init);
 
-	uint32_t baud = USART_BaudrateGet(USART1);
+	//uint32_t baud = USART_BaudrateGet(USART1);
 
 	USART1->CTRL |= USART_CTRL_AUTOCS;
 
@@ -278,155 +254,6 @@ void tft_print(uint16_t x_start, uint16_t y_start, uint16_t color, const char* f
     }
 }
 
-// Used by the read_register and write_register functions
-// data_array is read or write data, depending on the flag
-void i2c_transfer(uint16_t device_addr, uint8_t data_array[], uint16_t data_len, uint8_t flag)
-{
-	// Transfer structure
-	I2C_TransferSeq_TypeDef i2cTransfer;
-
-	// Initialize I2C transfer
-	I2C_TransferReturn_TypeDef result;
-	i2cTransfer.addr          = device_addr;
-	i2cTransfer.flags         = flag;
-	i2cTransfer.buf[0].data   = data_array;
-	i2cTransfer.buf[0].len    = data_len;
-
-	INT_Disable();
-
-	// Set up the transfer
-	result = I2C_TransferInit(I2C0, &i2cTransfer);
-
-	// Do it until the transfer is done
-	while (result != i2cTransferDone)
-	{
-		if (result != i2cTransferInProgress)
-		{
-			DEBUG_BREAK;
-		}
-		result = I2C_Transfer(I2C0);
-	}
-
-	INT_Enable();
-}
-
-// Tailored for the FT6x06 device only
-void i2c_read_device_id()
-{
-	// First, set the address to read
-	data_array[0] = FT6206_FIRMID_OFFSET;
-	i2c_transfer(FT6206_ADDR, data_array, 1, I2C_FLAG_WRITE);
-
-	// Then, do the actual read of the register contents, from the offset +9
-	i2c_transfer(FT6206_ADDR, data_array, 9, I2C_FLAG_READ);
-
-	// Check FT6206_FIRMID_OFFSET + 2 for FocalTech’s Panel ID = 0x11
-	if (data_array[2] != 0x11)
-	{
-		DEBUG_BREAK
-	}
-
-	// Set interrupts to polling mode
-	data_array[0] = FT6206_G_MODE_OFFSET;
-	data_array[1] = 0;
-	i2c_transfer(FT6206_ADDR, data_array, 2, I2C_FLAG_WRITE);
-
-	return;
-}
-
-// Helper function to convert touchscreen coordinates to touch screen coordinates
-uint16_t map(uint16_t x, uint16_t in_min, uint16_t in_max, uint16_t out_min, uint16_t out_max)
-{
-  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
-}
-
-void i2c_read_capacitance_values()
-{
-	// First, set the address to read
-	data_array[0] = 0;
-	i2c_transfer(FT6206_ADDR, data_array, 1, I2C_FLAG_WRITE);
-
-	// Then, do the actual read of the register contents, from the offset +15
-	i2c_transfer(FT6206_ADDR, data_array, 15, I2C_FLAG_READ);
-
-	num_touch_points = data_array[0x2] & 0x0F;
-	for (int i=0; i < num_touch_points; i++)
-	{
-		uint8_t base_offset = 0x3 + i * 0x6;
-
-		// Check the status, and shift over by 6 to compare bits 7:6 to 0b11
-		uint8_t status = data_array[base_offset];
-		if (((status >> 6) & 0b11) == 0b11)
-		{
-			touch_data[i].touched = false;
-		}
-		else
-		{
-			touch_data[i].touched = true;
-		}
-
-		touch_data[i].touch_id = data_array[base_offset + 0x2] & 0xF0;
-		uint16_t raw_x = data_array[base_offset + 0x1] + ((data_array[base_offset] & 0x0F) << 8);
-		uint16_t raw_y = data_array[base_offset + 0x3] + ((data_array[base_offset + 0x2] & 0x0F) << 8);
-		touch_data[i].x_position = map(raw_x, 0, ILI9341_TFTWIDTH, ILI9341_TFTWIDTH, 0);
-		touch_data[i].y_position = map(raw_y, 0, ILI9341_TFTHEIGHT, ILI9341_TFTHEIGHT, 0);
-	}
-}
-
-// Callback for capacitive sense IRQ
-int gpio_int_handler_process_touch(uint8_t pin)
-{
-	// Read the capacitance values into touch_data[]
-	i2c_read_capacitance_values();
-
-	interrupt_triggered = true;
-
-	return 0;
-}
-
-#define BOXSIZE 40
-void select_pen_color(uint16_t color)
-{
-	uint16_t box_x_start;
-	// First, unhighlight the old pen color
-	switch (pen_color)
-	{
-		case ILI9341_RED: { box_x_start = 0;  break;}
-		case ILI9341_YELLOW: { box_x_start = BOXSIZE;  break;}
-		case ILI9341_GREEN: { box_x_start = BOXSIZE*2;  break;}
-		case ILI9341_CYAN: { box_x_start = BOXSIZE*3;  break;}
-		case ILI9341_BLUE: { box_x_start = BOXSIZE*4;  break;}
-		case ILI9341_MAGENTA: { box_x_start = BOXSIZE*5;  break;}
-	}
-	draw_unfilled_rectangle(box_x_start, 0, BOXSIZE, BOXSIZE, 6, pen_color);
-
-	// Now highlight the new color
-	pen_color = color;
-	switch (pen_color)
-	{
-		case ILI9341_RED: { box_x_start = 0; break;}
-		case ILI9341_YELLOW: { box_x_start = BOXSIZE;  break;}
-		case ILI9341_GREEN: { box_x_start = BOXSIZE*2;  break;}
-		case ILI9341_CYAN: { box_x_start = BOXSIZE*3;  break;}
-		case ILI9341_BLUE: { box_x_start = BOXSIZE*4;  break;}
-		case ILI9341_MAGENTA: { box_x_start = BOXSIZE*5;  break;}
-	}
-	draw_unfilled_rectangle(box_x_start, 0, BOXSIZE, BOXSIZE, 6, ILI9341_WHITE);
-}
-
-
-void draw_color_pallet()
-{
-	draw_filled_rectangle(0, 0, BOXSIZE, BOXSIZE, ILI9341_RED);
-	draw_filled_rectangle(BOXSIZE, 0, BOXSIZE*2, BOXSIZE, ILI9341_YELLOW);
-	draw_filled_rectangle(BOXSIZE*2, 0, BOXSIZE*3, BOXSIZE, ILI9341_GREEN);
-	draw_filled_rectangle(BOXSIZE*3, 0, BOXSIZE*4, BOXSIZE, ILI9341_CYAN);
-	draw_filled_rectangle(BOXSIZE*4, 0, BOXSIZE*5, BOXSIZE, ILI9341_BLUE);
-	draw_filled_rectangle(BOXSIZE*5, 0, BOXSIZE*6, BOXSIZE, ILI9341_MAGENTA);
-//	pen_color = ILI9341_RED;
-//	select_pen_color(pen_color);
-}
-
 /**************************************************************************//**
  * @brief  Main function
  *****************************************************************************/
@@ -459,69 +286,13 @@ int main(void)
 	writecommand(ILI9341_MADCTL);    // Memory Access Control
 	writedata(0x48);
 
-	delay(200);
-
 	draw_filled_rectangle(0,0, ILI9341_TFTWIDTH, ILI9341_TFTHEIGHT, ILI9341_BLACK);
-	tft_print(60,100, ILI9341_RED, "FINGER PAINTING");
-	tft_print(40,160, ILI9341_WHITE, "Touch screen to start");
+	//draw_char(col, 100, 'A', ILI9341_WHITE);
+	tft_print(60,160, ILI9341_RED, "EFM32 Rocks: %d!", 2);
 
-	// Check to see that we can talk to the i2c capacitive sensor
-	i2c_read_device_id();
-
-	// Set up capsense interrupt
-	set_gpio_interrupt(gpioPortD, 13, false, true, (GPIOINT_IrqCallbackPtr_t) gpio_int_handler_process_touch);
-
-	draw_color_pallet();
-
-	bool activated = false;
 	/* Infinite loop */
 	while (1)
 	{
-		// Keep checking after the first interrupt until the event is over
-		if (interrupt_triggered)
-		{
-			i2c_read_capacitance_values();
-			if (!activated)
-			{
-				// Clear the screen and display the color palette
-				draw_filled_rectangle(0,0, ILI9341_TFTWIDTH, ILI9341_TFTHEIGHT, ILI9341_BLACK);
-				draw_color_pallet();
-				pen_color = ILI9341_RED;
-				select_pen_color(pen_color);
-				activated = true;
-				delay(100);
-				continue;
-			}
-		}
-
-		// Process any touches
-		for (int i=0; i<num_touch_points; i++)
-		{
-			if (touch_data[i].touched)
-			{
-				uint16_t x = touch_data[i].x_position;
-				uint16_t y = touch_data[i].y_position;
-
-				if (y < BOXSIZE)
-				{
-					if (x < BOXSIZE) select_pen_color(ILI9341_RED);
-					else if (x < BOXSIZE*2) select_pen_color(ILI9341_YELLOW);
-					else if (x < BOXSIZE*3) select_pen_color(ILI9341_GREEN);
-					else if (x < BOXSIZE*4) select_pen_color(ILI9341_CYAN);
-					else if (x < BOXSIZE*5) select_pen_color(ILI9341_BLUE);
-					else select_pen_color(ILI9341_MAGENTA);
-					delay(200);
-					continue;
-				}
-				draw_filled_rectangle(x, y, x+6, y+6, pen_color);
-			}
-			else
-			{
-				interrupt_triggered = false;
-			}
-		}
-		num_touch_points = 0;
-		//delay(10);
 
 	}
 }
